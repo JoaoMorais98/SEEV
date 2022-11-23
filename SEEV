@@ -1,0 +1,345 @@
+#include <Wire.h>
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "esp_task_wdt.h"
+#include "Arduino.h"
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+
+//Conversão de escala
+float floatMap(float x, float in_min, float in_max, float out_min,
+    float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+//Pinos Sensores, LED's e Potenciometros
+#define PIN_SensorLUZ 39
+#define LED_azul 26 //
+#define LED_verde 13 
+#define LED_amarelo 15
+
+#define Potdoor 36 //pot placa
+#define Potgate 37 //pot
+#define PotcarA 17
+#define PotcarB 12
+
+//Temperatura e Humidade
+#define DHTTYPE    DHT11 
+#define DHTPIN 27
+DHT_Unified dht(DHTPIN, DHTTYPE);
+float Temperatura;
+float Humidade;
+float Luminosidade;
+
+//Handle das filas
+QueueHandle_t FilaTemperatura;
+QueueHandle_t FilaLuminosidade;
+QueueHandle_t FilaHumidade;
+QueueHandle_t FilaPotdoor;
+QueueHandle_t FilaPotgate;
+QueueHandle_t FilaPotcarA;
+QueueHandle_t FilaPotcarB;
+QueueHandle_t FilaEstadoLuz;
+QueueHandle_t FilaAIR;
+
+//Handle Semaforo
+SemaphoreHandle_t Mutex;
+
+//Funçoes
+void LUZ (void *pvParamenters);
+void DHT (void *pvParameters);
+void FAN (void *pvParameters);
+void LED (void *pvParameters);
+void POT (void *pvParameters);
+void AIR (void *pvParameters);
+void MON (void *pvParameters);
+//Handle tarefas
+TaskHandle_t tarefaLUZ;
+TaskHandle_t tarefaDHT;
+TaskHandle_t tarefaFAN;
+TaskHandle_t tarefaLED;
+TaskHandle_t tarefaPOT;
+TaskHandle_t tarefaAIR;
+TaskHandle_t tarefaMON;
+
+
+void setup() {
+
+  Serial.begin(115200);
+  vTaskDelay(1000/portTICK_PERIOD_MS);
+  Serial.print(F("Projecto SEEV"));
+
+//Criar Filas
+FilaTemperatura = xQueueCreate(2, sizeof(float));
+FilaLuminosidade = xQueueCreate(2, sizeof(float));
+FilaHumidade = xQueueCreate(2, sizeof(float));
+FilaPotdoor = xQueueCreate(2, sizeof(int));
+FilaPotgate = xQueueCreate(2, sizeof(int));
+FilaPotcarA = xQueueCreate(2, sizeof(int));
+FilaPotcarB = xQueueCreate(2, sizeof(int));
+FilaAIR = xQueueCreate(2, sizeof(int));
+
+//Criar Semaforo
+Mutex = xSemaphoreCreateMutex();
+
+  //Criar tarefas
+	xTaskCreatePinnedToCore(LUZ, "Luminosidade", 8000, NULL, 5, NULL, 1); //Prioridade 5
+
+	xTaskCreatePinnedToCore(DHT, "Temperatura e Humidade", 8000, &tarefaDHT, 6, NULL, 1); //Prioridade 6 Temperatura +Importante
+
+	xTaskCreatePinnedToCore(FAN, "Ventoinha", 8000, &tarefaFAN, 4, NULL, 1); //Prioridade 4
+
+	xTaskCreatePinnedToCore(LED, "Led", 8000, &tarefaLED, 3, NULL, 1); //Prioridade 3
+
+  xTaskCreatePinnedToCore(POT, "Potenciometros", 8000, &tarefaPOT, 4, NULL, 1); //Prioridade 4
+
+  xTaskCreatePinnedToCore(AIR, "Qualidade do ar", 8000, &tarefaAIR, 3, NULL, 1); //Prioridade 1
+
+  //xTaskCreatePinnedToCore(MON, "Monitorização", 8000, &tarefaMON, 7, NULL,1);
+
+  pinMode(LED_azul, OUTPUT);
+  pinMode(LED_amarelo, OUTPUT);
+  pinMode(LED_verde, OUTPUT);
+
+  dht.begin();
+  sensor_t sensor;
+
+  for(;;);
+  // put your setup code here, to run once:
+
+}
+
+void LUZ (void *pvParameters){
+
+  for (;;){
+
+  //Serial.print(F("Tarefa sensor luminosidade \n"));
+  
+  int luz = analogRead(PIN_SensorLUZ);
+  Luminosidade = luz;
+  //Serial.print(Luminosidade);
+  xQueueSend(FilaLuminosidade, &Luminosidade, portMAX_DELAY);
+
+  vTaskDelay(2000/ portTICK_PERIOD_MS);
+
+  }
+}
+
+void DHT (void *pvParameters){
+ 
+	for (;;){
+  
+  //Serial.print(F("Tarefa DHT \n"));
+
+  sensors_event_t event;
+  dht.temperature().getEvent(&event);
+  Temperatura = event.temperature;
+  Serial.print("Temperatura: \n");
+  Serial.print(Temperatura);
+  //Serial.print("\n");
+  xQueueSend(FilaTemperatura, &Temperatura, portMAX_DELAY);
+
+  xSemaphoreTake(Mutex, portMAX_DELAY);
+  dht.humidity().getEvent(&event);
+  Humidade = event.relative_humidity;
+  //Serial.print("Humidade: \n");
+  //Serial.print(Humidade);
+  //Serial.print("\n");
+  xSemaphoreGive(Mutex);
+
+  vTaskDelay(2000/ portTICK_PERIOD_MS);
+  }
+}
+
+void FAN (void *pvParameters){
+
+  
+  float FAN_speed = 0;
+  float TempToSpeed = 0;
+
+	for (;;){
+
+
+	//Serial.print(F("\n Tarefa ventoinha\n"));
+	
+	xQueueReceive(FilaTemperatura, &FAN_speed, portMAX_DELAY);
+    //Serial.print(FAN_speed);
+
+  TempToSpeed = floatMap(FAN_speed, 0, 50, 1000, 0);
+   //Serial.print(TempToSpeed);
+
+	if (FAN_speed >= 22){ //Value for demo
+		digitalWrite(LED_verde, HIGH);
+		vTaskDelay(TempToSpeed/ portTICK_PERIOD_MS);
+		digitalWrite(LED_verde, LOW);
+
+  
+    if (FAN_speed <22){ //Value for demo
+    digitalWrite(LED_verde, LOW);
+    }
+  }
+}
+}
+void POT (void *pvParameters){
+
+	for (;;){
+  
+  //Serial.print(F("\n Tarefa dos potenciometros \n"));
+
+  int Statusdoor = analogRead(Potdoor); //Estado interruptor e sensores
+  int Statusgate = analogRead(Potgate);
+  int StatusCarA = analogRead(PotcarA);
+  int StatusCarB = analogRead(PotcarB);
+
+  int Interruptordoor = 0;
+  int Interruptorgate = 0;
+  int SensorCarA = 0;
+  int SensorCarB = 0;
+  
+  if(Statusdoor <= 2000){
+    Interruptordoor = 0;
+    //Serial.print(F("Porta casa fechada"));
+  } else
+    Interruptordoor = 1;
+    //Serial.print(F("Porta de casa aberta"));
+  xQueueSend(FilaPotdoor, &Interruptordoor, portMAX_DELAY);
+
+  if(Statusgate <= 2000){
+    Interruptorgate = 0;
+    //Serial.print(F("Portao fechado"));
+  } else
+    Interruptorgate = 1;
+    //Serial.print(F("Portao Aberto"));
+  xQueueSend(FilaPotgate, &Interruptorgate, portMAX_DELAY);
+
+  if(StatusCarA <= 4000){
+    SensorCarA = 0;
+    //Serial.print(F("Lugar A livre"));
+  } else
+    SensorCarA = 1;
+    //Serial.print(F("Lugar A ocupado"));
+  xQueueSend(FilaPotcarA, &SensorCarA, portMAX_DELAY);
+
+  if(StatusCarB <= 4000){
+    SensorCarB = 0;
+    //Serial.print(F("Lugar B livre"));
+  } else
+    SensorCarB = 1;  
+    //Serial.print(F("Lugar B ocupado"));
+  xQueueSend(FilaPotcarB, &SensorCarB, portMAX_DELAY);
+
+  //Serial.print("Porta: \n");
+  //Serial.print(Statusdoor);
+
+  }
+}
+
+void LED (void *pvParameters){
+  int door = 0;
+  int gate = 0;
+  int carA = 0;
+  int carB = 0;
+  float LUX = 0;
+
+	for (;;){
+
+  //Serial.print(F("\n Tarefa Luzes garagem \n"));
+
+  xQueueReceive(FilaPotdoor, &door, portMAX_DELAY);
+  xQueueReceive(FilaPotgate, &gate, portMAX_DELAY);
+  xQueueReceive(FilaPotcarA, &carA, portMAX_DELAY);
+  xQueueReceive(FilaPotcarB, &carB, portMAX_DELAY);
+  xQueueReceive(FilaLuminosidade, &LUX, portMAX_DELAY);
+
+
+  if(door == 1 || gate == 1){
+    digitalWrite(LED_amarelo, HIGH);
+
+  }else
+    digitalWrite(LED_amarelo, LOW);
+
+
+  }
+}
+
+void AIR (void *pvParameters){
+
+  for (;;){
+
+  //Serial.print(F("\n Tarefa AIR \n"));
+  sensors_event_t event;
+
+  xSemaphoreTake(Mutex, portMAX_DELAY);
+  dht.humidity().getEvent(&event);
+  Humidade = event.relative_humidity *100;
+  //xQueueSend(FilaAIR, &Humidade, portMAX_DELAY);
+  //Serial.print("Qualidade do ar:\n");
+  //Serial.print(Humidade);
+  xSemaphoreGive(Mutex);
+  vTaskDelay(5000/ portTICK_PERIOD_MS);
+  }
+}
+/*
+void MON (void*pvParameters){
+  
+  int EstadoPorta = 0;
+  int EstadoPortao = 0;
+  int EstadoVentoinha = 0;
+  int EstadoTemperatura = 0;
+  int EstadoHumidade = 0;
+  int EstadoAr = 0;
+  
+  for (;;){
+  
+  Serial.print("Projeto SEEV - Joao Morais\n\n");
+
+  xQueueReceive(FilaPotdoor, &EstadoPorta, 0);
+  xQueueReceive(FilaPotgate, &EstadoPortao, 0);
+  xQueueReceive(FilaTemperatura, &EstadoTemperatura, 0);
+
+  if(EstadoPorta == 1 ||EstadoPortao == 1){
+    Serial.print("Luz: Acesa               ");
+    Serial.print("Porta: Aberta\n");
+
+  }else
+    Serial.print("Luz: Apagada               ");
+    Serial.print("Porta: Fechada\n");
+
+
+  	if (Temperatura >= 22){ 
+    Serial.print("Temperatura: ");
+    Serial.print(Temperatura);
+    Serial.print("         ");
+    Serial.print("Ventoinha: ");
+		Serial.print("Ligada \n");
+  
+    if (Temperatura <22){
+      Serial.print("Temperatura: ");
+      Serial.print(Temperatura);
+      Serial.print("         ");
+      Serial.print("Ventoinha: "); 
+      Serial.print("Desligada\n");
+    }
+  }
+
+  Serial.print("Humidade: ");
+  Serial.print(Humidade);
+  Serial.print("%         ");
+
+  Serial.print("Qualidade Ar: ");
+  Serial.print(Humidade*100);
+  Serial.print("\n\n");  
+
+
+
+  vTaskDelay(7000/ portTICK_PERIOD_MS);
+}
+}
+*/
+void loop() {
+  // put your main code here, to run repeatedly:
+}
